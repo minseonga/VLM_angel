@@ -219,7 +219,7 @@ def logitLens_of_vision_tokens_with_discrete_range(
     each_range_layer_prob_list = []
     each_range_layer_words_list = []
     x_ticks = []
-    y_ticks = [f'{i} h_out' for i in layer_range]
+    y_ticks = [f'{i} h_out' for i in reversed(layer_range)]
 
     for i, token_range in enumerate(vision_discrete_range):
         x_ticks += np.arange(discrete_range[i][0], discrete_range[i][1] + 1).tolist()
