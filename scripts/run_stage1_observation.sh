@@ -10,6 +10,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-stage1_outputs}"
 NUM_SAMPLES="${NUM_SAMPLES:-500}"
 OVERLAP_MODE="${OVERLAP_MODE:-iqr}"
 MAX_RECORDS="${MAX_RECORDS:-}"
+BOOTSTRAP_ITERS="${BOOTSTRAP_ITERS:-1000}"
+TOKEN_STEP_BINS="${TOKEN_STEP_BINS:-4}"
+SVAR_MATCH_THRESHOLD="${SVAR_MATCH_THRESHOLD:-0.05}"
+TOKEN_STEP_MATCH_THRESHOLD="${TOKEN_STEP_MATCH_THRESHOLD:-}"
 
 COMMON_ARGS=(
   --model llava-1.5
@@ -40,3 +44,17 @@ python scripts/stage1_trace_head_logit_contrib.py "${TRACE_ARGS[@]}"
 python scripts/stage1_analyze_head_contrib.py \
   --contrib-file "${OUTPUT_DIR}/stage1_head_logit_contrib.pt" \
   --output-dir "${OUTPUT_DIR}"
+
+CONTROL_ARGS=(
+  --contrib-file "${OUTPUT_DIR}/stage1_head_logit_contrib.pt"
+  --output-dir "${OUTPUT_DIR}"
+  --bootstrap-iters "${BOOTSTRAP_ITERS}"
+  --token-step-bins "${TOKEN_STEP_BINS}"
+  --svar-match-threshold "${SVAR_MATCH_THRESHOLD}"
+)
+
+if [[ -n "${TOKEN_STEP_MATCH_THRESHOLD}" ]]; then
+  CONTROL_ARGS+=(--token-step-match-threshold "${TOKEN_STEP_MATCH_THRESHOLD}")
+fi
+
+python scripts/stage1_controlled_analysis.py "${CONTROL_ARGS[@]}"
