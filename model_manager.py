@@ -83,8 +83,9 @@ def prepare_llava_inputs(template, query, image_tensor, tokenizer):
 
 
 class ModelManager:
-    def __init__(self, model_name):
+    def __init__(self, model_name, model_path=None):
         self.model_name = model_name.lower()
+        self.model_path = model_path
         self.tokenizer = None
         self.vlm_model = None
         self.llm_model = None
@@ -93,7 +94,8 @@ class ModelManager:
 
     def load_model(self):
         if self.model_name == "llava-1.5":
-            model_path = os.path.expanduser("/path/to/llava-v1.5-7b")
+            model_path = self.model_path or os.environ.get("LLAVA_MODEL_PATH") or "/path/to/llava-v1.5-7b"
+            model_path = os.path.expanduser(model_path)
             self.tokenizer, self.vlm_model, self.image_processor, self.llm_model = (
                 load_llava_model(model_path)
             )
