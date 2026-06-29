@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from stage1_analyze_head_contrib import binary_auc, write_csv
-from stage1_common import torch_load_compat
+from stage1_common import torch_load_compat, write_records_csv
 
 
 DEFAULT_METRICS = [
@@ -135,7 +135,7 @@ def main():
             "top_metrics_by_oriented_auc": ranked[:10],
         }, f, indent=2)
 
-    write_csv(records, output_dir / "stage1_vocab_entropy_object_records_flat.csv", exclude_keys={"caption"})
+    write_records_csv(records, output_dir / "stage1_vocab_entropy_object_records_flat.csv", exclude_keys={"caption"})
     write_csv(ranked, output_dir / "stage1_vocab_entropy_metric_summary.csv")
 
     print(json.dumps({
