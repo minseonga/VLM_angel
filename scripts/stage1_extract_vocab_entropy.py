@@ -7,6 +7,7 @@ For each generated step this saves:
   - normalized entropy H(p) / log(|V|)
   - min-entropy -log(max p)
   - top-k mass and entropy over the renormalized top-k distribution
+  - bottom-k mass and entropy over the renormalized bottom-k distribution
   - actual generated token probability/rank
 
 It also labels generated COCO object mentions with CHAIR and joins the step-level
@@ -54,11 +55,12 @@ def parse_args():
     parser.add_argument("--beam", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--top-k", nargs="+", type=int, default=[5, 10, 50, 100])
+    parser.add_argument("--bottom-k", nargs="+", type=int, default=[5, 10, 50, 100])
     parser.add_argument("--save-top-tokens", type=int, default=10)
     return parser.parse_args()
 
 
-def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, save_top_tokens):
+def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, bottom_ks, save_top_tokens):
     logits = logits.detach().float().cpu()
     probs = torch.softmax(logits, dim=-1)
     log_probs = torch.log_softmax(logits, dim=-1)
@@ -110,6 +112,21 @@ def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, save
         record[f"top{k}_entropy"] = top_entropy
         record[f"top{k}_normalized_entropy"] = top_entropy / math.log(kk) if kk > 1 else 0.0
 
+    if bottom_ks:
+        bottom_max_k = min(max(bottom_ks), vocab_size)
+        bottom_logits, bottom_ids = torch.topk(logits, k=bottom_max_k, largest=False)
+        bottom_probs = probs[bottom_ids].numpy()
+
+        for k in bottom_ks:
+            kk = min(int(k), vocab_size)
+            vals = bottom_probs[:kk]
+            mass = float(vals.sum())
+            q = torch.softmax(bottom_logits[:kk], dim=-1).numpy()
+            bottom_entropy = float(-(q * np.log(np.maximum(q, 1e-45))).sum())
+            record[f"bottom{k}_mass"] = mass
+            record[f"bottom{k}_entropy"] = bottom_entropy
+            record[f"bottom{k}_normalized_entropy"] = bottom_entropy / math.log(kk) if kk > 1 else 0.0
+
     if save_top_tokens > 0:
         tops = []
         for prob, token_id in zip(top_vals[:save_top_tokens], top_ids[:save_top_tokens]):
@@ -140,12 +157,15 @@ def summarize_object_entropy(records):
         "actual_surprisal",
         "actual_rank",
     ]
-    top_metric_names = []
+    subset_metric_names = []
     for record in records:
         for key in record:
-            if key.startswith("top") and (key.endswith("_mass") or key.endswith("_entropy")):
-                top_metric_names.append(key)
-    metrics.extend(sorted(set(top_metric_names)))
+            if (
+                (key.startswith("top") or key.startswith("bottom"))
+                and (key.endswith("_mass") or key.endswith("_entropy"))
+            ):
+                subset_metric_names.append(key)
+    metrics.extend(sorted(set(subset_metric_names)))
 
     for metric in metrics:
         vals_by_label = {}
@@ -247,6 +267,7 @@ def main():
                 generated_ids[step],
                 model_manager.tokenizer,
                 args.top_k,
+                args.bottom_k,
                 args.save_top_tokens,
             )
             step_record = {

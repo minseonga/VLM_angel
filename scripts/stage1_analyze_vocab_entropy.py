@@ -32,6 +32,14 @@ DEFAULT_METRICS = [
     "top50_entropy",
     "top100_mass",
     "top100_entropy",
+    "bottom5_mass",
+    "bottom5_entropy",
+    "bottom10_mass",
+    "bottom10_entropy",
+    "bottom50_mass",
+    "bottom50_entropy",
+    "bottom100_mass",
+    "bottom100_entropy",
 ]
 
 
