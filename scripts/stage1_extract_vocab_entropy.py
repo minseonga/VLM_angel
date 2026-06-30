@@ -56,11 +56,56 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--top-k", nargs="+", type=int, default=[5, 10, 50, 100])
     parser.add_argument("--bottom-k", nargs="+", type=int, default=[5, 10, 50, 100])
+    parser.add_argument(
+        "--top-k-frac",
+        nargs="+",
+        type=float,
+        default=[],
+        help="Fractions of the vocabulary for top-k entropy, e.g. 0.0001 0.001 0.01.",
+    )
+    parser.add_argument(
+        "--bottom-k-frac",
+        nargs="+",
+        type=float,
+        default=[],
+        help="Fractions of the vocabulary for bottom-k entropy, e.g. 0.0001 0.001 0.01.",
+    )
     parser.add_argument("--save-top-tokens", type=int, default=10)
     return parser.parse_args()
 
 
-def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, bottom_ks, save_top_tokens):
+def fraction_label(frac):
+    return f"{frac * 100:g}".replace("-", "m").replace(".", "p")
+
+
+def k_from_fraction(frac, vocab_size):
+    if frac <= 0 or frac > 1:
+        raise ValueError(f"Vocabulary fraction must be in (0, 1], got {frac}.")
+    return min(vocab_size, max(1, int(math.ceil(vocab_size * frac))))
+
+
+def build_k_specs(kind, ks, fracs, vocab_size):
+    specs = []
+    for k in ks or []:
+        kk = min(int(k), vocab_size)
+        if kk <= 0:
+            raise ValueError(f"{kind}-k values must be positive, got {k}.")
+        specs.append((f"{kind}{int(k)}", kk))
+    for frac in fracs or []:
+        specs.append((f"{kind}{fraction_label(frac)}pct", k_from_fraction(float(frac), vocab_size)))
+    return specs
+
+
+def entropy_metrics_from_logits(
+    logits,
+    actual_token_id,
+    tokenizer,
+    top_ks,
+    bottom_ks,
+    top_k_fracs,
+    bottom_k_fracs,
+    save_top_tokens,
+):
     logits = logits.detach().float().cpu()
     probs = torch.softmax(logits, dim=-1)
     log_probs = torch.log_softmax(logits, dim=-1)
@@ -94,13 +139,15 @@ def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, bott
         "actual_rank": actual_rank,
     }
 
-    max_k = max(max(top_ks), save_top_tokens)
+    top_specs = build_k_specs("top", top_ks, top_k_fracs, vocab_size)
+    bottom_specs = build_k_specs("bottom", bottom_ks, bottom_k_fracs, vocab_size)
+
+    max_k = max([k for _, k in top_specs] + [save_top_tokens])
     top_vals, top_ids = torch.topk(probs, k=min(max_k, vocab_size))
     top_vals = top_vals.numpy()
     top_ids = top_ids.numpy()
 
-    for k in top_ks:
-        kk = min(int(k), vocab_size)
+    for prefix, kk in top_specs:
         vals = top_vals[:kk]
         mass = float(vals.sum())
         if mass > 0:
@@ -108,24 +155,25 @@ def entropy_metrics_from_logits(logits, actual_token_id, tokenizer, top_ks, bott
             top_entropy = float(-(q * np.log(np.maximum(q, 1e-45))).sum())
         else:
             top_entropy = 0.0
-        record[f"top{k}_mass"] = mass
-        record[f"top{k}_entropy"] = top_entropy
-        record[f"top{k}_normalized_entropy"] = top_entropy / math.log(kk) if kk > 1 else 0.0
+        record[f"{prefix}_k"] = kk
+        record[f"{prefix}_mass"] = mass
+        record[f"{prefix}_entropy"] = top_entropy
+        record[f"{prefix}_normalized_entropy"] = top_entropy / math.log(kk) if kk > 1 else 0.0
 
-    if bottom_ks:
-        bottom_max_k = min(max(bottom_ks), vocab_size)
+    if bottom_specs:
+        bottom_max_k = min(max(k for _, k in bottom_specs), vocab_size)
         bottom_logits, bottom_ids = torch.topk(logits, k=bottom_max_k, largest=False)
         bottom_probs = probs[bottom_ids].numpy()
 
-        for k in bottom_ks:
-            kk = min(int(k), vocab_size)
+        for prefix, kk in bottom_specs:
             vals = bottom_probs[:kk]
             mass = float(vals.sum())
             q = torch.softmax(bottom_logits[:kk], dim=-1).numpy()
             bottom_entropy = float(-(q * np.log(np.maximum(q, 1e-45))).sum())
-            record[f"bottom{k}_mass"] = mass
-            record[f"bottom{k}_entropy"] = bottom_entropy
-            record[f"bottom{k}_normalized_entropy"] = bottom_entropy / math.log(kk) if kk > 1 else 0.0
+            record[f"{prefix}_k"] = kk
+            record[f"{prefix}_mass"] = mass
+            record[f"{prefix}_entropy"] = bottom_entropy
+            record[f"{prefix}_normalized_entropy"] = bottom_entropy / math.log(kk) if kk > 1 else 0.0
 
     if save_top_tokens > 0:
         tops = []
@@ -268,6 +316,8 @@ def main():
                 model_manager.tokenizer,
                 args.top_k,
                 args.bottom_k,
+                args.top_k_frac,
+                args.bottom_k_frac,
                 args.save_top_tokens,
             )
             step_record = {

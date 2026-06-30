@@ -15,7 +15,7 @@ from stage1_analyze_head_contrib import binary_auc, write_csv
 from stage1_common import torch_load_compat, write_records_csv
 
 
-DEFAULT_METRICS = [
+BASE_METRICS = [
     "entropy",
     "normalized_entropy",
     "effective_vocab_size",
@@ -24,6 +24,9 @@ DEFAULT_METRICS = [
     "actual_prob",
     "actual_surprisal",
     "actual_rank",
+]
+
+DEFAULT_SUBSET_METRICS = [
     "top5_mass",
     "top5_entropy",
     "top10_mass",
@@ -47,7 +50,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Analyze vocab entropy object-token metrics.")
     parser.add_argument("--entropy-file", type=str, default="stage1_vocab_entropy/stage1_vocab_entropy.pt")
     parser.add_argument("--output-dir", type=str, default="stage1_vocab_entropy")
-    parser.add_argument("--metrics", nargs="*", default=DEFAULT_METRICS)
+    parser.add_argument(
+        "--metrics",
+        nargs="*",
+        default=None,
+        help="Metrics to analyze. Defaults to auto-discovering scalar entropy/mass metrics in the payload.",
+    )
     parser.add_argument("--bootstrap-iters", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=927)
     return parser.parse_args()
@@ -57,6 +65,39 @@ def as_float(value):
     if value == "" or value is None:
         return None
     return float(value)
+
+
+def discover_metrics(records):
+    metrics = []
+    seen = set()
+
+    def add(metric):
+        if metric in seen:
+            return
+        for record in records:
+            if as_float(record.get(metric)) is not None:
+                metrics.append(metric)
+                seen.add(metric)
+                return
+
+    for metric in BASE_METRICS + DEFAULT_SUBSET_METRICS:
+        add(metric)
+
+    for record in records:
+        for key in record:
+            if key in seen:
+                continue
+            if not (key.startswith("top") or key.startswith("bottom")):
+                continue
+            if not (
+                key.endswith("_mass")
+                or key.endswith("_entropy")
+                or key.endswith("_normalized_entropy")
+            ):
+                continue
+            add(key)
+
+    return metrics
 
 
 def bootstrap_auc_ci(labels, scores, iters, rng):
@@ -120,9 +161,10 @@ def main():
 
     payload = torch_load_compat(args.entropy_file, map_location="cpu")
     records = payload["object_records"]
+    metrics = args.metrics if args.metrics is not None else discover_metrics(records)
 
     summary = {}
-    for metric in args.metrics:
+    for metric in metrics:
         cur = summarize_metric(records, metric, args.bootstrap_iters, rng)
         if cur is not None:
             summary[metric] = cur
@@ -139,6 +181,7 @@ def main():
             "num_object_records": len(records),
             "num_grounded": int(sum(int(r["label"]) == 1 for r in records)),
             "num_hallucinated": int(sum(int(r["label"]) == 0 for r in records)),
+            "analyzed_metrics": metrics,
             "metric_summary": summary,
             "top_metrics_by_oriented_auc": ranked[:10],
         }, f, indent=2)
