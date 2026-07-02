@@ -64,6 +64,11 @@ def parse_args():
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument(
+        "--score-only",
+        action="store_true",
+        help="Skip generation and compute CHAIR/summary from an existing variant captions jsonl.",
+    )
+    parser.add_argument(
         "--custom-greedy",
         action="store_true",
         help="Use the replay-based greedy loop. Required internally for contrib_gated_ablate.",
@@ -394,25 +399,48 @@ def write_jsonl(records, path):
             f.write("\n")
 
 
+def write_chair_outputs(args, output_dir, name, selected_heads, caption_records, caption_path, evaluator):
+    chair_output = evaluator.compute_chair(str(caption_path), "image_id", "caption")
+    detail_path = output_dir / f"{name}_chair_details.json"
+    summary_path = output_dir / f"{name}_summary.json"
+    with open(detail_path, "w") as f:
+        json.dump(chair_output, f, indent=2)
+
+    summary = {
+        "variant": name,
+        "config": vars(args),
+        "num_captions": len(caption_records),
+        "num_heads": len(selected_heads) if args.mode != "none" else 0,
+        "selected_heads": selected_heads,
+        "total_gated_steps": int(sum(record.get("num_gated_steps", 0) for record in caption_records)),
+        "overall_metrics": chair_output["overall_metrics"],
+        "outputs": {
+            "captions": str(caption_path),
+            "chair_details": str(detail_path),
+        },
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(json.dumps({
+        "variant": name,
+        "num_captions": len(caption_records),
+        "num_heads": summary["num_heads"],
+        "overall_metrics": summary["overall_metrics"],
+        "outputs": {
+            "summary": str(summary_path),
+            "captions": str(caption_path),
+            "chair_details": str(detail_path),
+        },
+    }, indent=2))
+
+
 def main():
     args = parse_args()
-    if not args.model_path:
-        raise ValueError("Set --model-path or LLAVA_MODEL_PATH for LLaVA weights.")
-
-    from llava.mm_utils import process_images
-    from model_manager import ModelManager
-    from utils import disable_torch_init, setup_seeds
-
-    setup_seeds()
-    disable_torch_init()
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     name = variant_name(args)
-
-    instructions = load_jsonl(args.instruction_path)
-    if args.num_samples is not None:
-        instructions = instructions[: args.num_samples]
+    caption_path = output_dir / f"{name}_captions.jsonl"
 
     selected_heads = load_selected_heads(
         args.heads_json,
@@ -425,10 +453,31 @@ def main():
         raise ValueError(f"No heads loaded for {args.head_set}; pass --heads-json or use --mode none.")
 
     evaluator = load_chair_evaluator(args.cache, args.annotations_path)
+
+    if args.score_only:
+        if not caption_path.exists():
+            raise FileNotFoundError(f"Cannot score missing captions file: {caption_path}")
+        caption_records = load_jsonl(caption_path)
+        write_chair_outputs(args, output_dir, name, selected_heads, caption_records, caption_path, evaluator)
+        return
+
+    if not args.model_path:
+        raise ValueError("Set --model-path or LLAVA_MODEL_PATH for LLaVA weights.")
+
+    from llava.mm_utils import process_images
+    from model_manager import ModelManager
+    from utils import disable_torch_init, setup_seeds
+
+    setup_seeds()
+    disable_torch_init()
+
+    instructions = load_jsonl(args.instruction_path)
+    if args.num_samples is not None:
+        instructions = instructions[: args.num_samples]
+
     model_manager = ModelManager(args.model, model_path=args.model_path)
 
     caption_records = []
-    caption_path = output_dir / f"{name}_captions.jsonl"
 
     for idx, item in tqdm(list(enumerate(instructions)), desc=name):
         image_id = int(item["image_id"])
@@ -504,40 +553,7 @@ def main():
             torch.cuda.empty_cache()
 
     write_jsonl(caption_records, caption_path)
-
-    chair_output = evaluator.compute_chair(str(caption_path), "image_id", "caption")
-    detail_path = output_dir / f"{name}_chair_details.json"
-    summary_path = output_dir / f"{name}_summary.json"
-    with open(detail_path, "w") as f:
-        json.dump(chair_output, f, indent=2)
-
-    summary = {
-        "variant": name,
-        "config": vars(args),
-        "num_captions": len(caption_records),
-        "num_heads": len(selected_heads) if args.mode != "none" else 0,
-        "selected_heads": selected_heads,
-        "total_gated_steps": int(sum(record.get("num_gated_steps", 0) for record in caption_records)),
-        "overall_metrics": chair_output["overall_metrics"],
-        "outputs": {
-            "captions": str(caption_path),
-            "chair_details": str(detail_path),
-        },
-    }
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(json.dumps({
-        "variant": name,
-        "num_captions": len(caption_records),
-        "num_heads": summary["num_heads"],
-        "overall_metrics": summary["overall_metrics"],
-        "outputs": {
-            "summary": str(summary_path),
-            "captions": str(caption_path),
-            "chair_details": str(detail_path),
-        },
-    }, indent=2))
+    write_chair_outputs(args, output_dir, name, selected_heads, caption_records, caption_path, evaluator)
 
 
 if __name__ == "__main__":
