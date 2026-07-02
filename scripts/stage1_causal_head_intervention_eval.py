@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import random
 import types
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from stage1_common import (
     load_chair_evaluator,
     load_jsonl,
 )
+from stage1_trace_head_logit_contrib import install_head_logit_tracer
 
 
 def parse_args():
@@ -42,41 +44,76 @@ def parse_args():
     parser.add_argument("--heads-json", type=str, default=None)
     parser.add_argument(
         "--head-set",
-        choices=["support_heads", "prior_heads", "random_heads"],
-        default="support_heads",
+        choices=["wrong_heads", "support_heads", "prior_heads", "random_heads"],
+        default="wrong_heads",
     )
     parser.add_argument(
         "--mode",
-        choices=["none", "visual_boost", "visual_suppress", "head_scale"],
+        choices=["none", "visual_boost", "visual_suppress", "head_scale", "contrib_gated_ablate"],
         default="none",
     )
     parser.add_argument("--alpha", type=float, default=0.5, help="Attention-logit shift for visual boost/suppress.")
     parser.add_argument("--head-scale", type=float, default=0.0, help="Scale for selected head outputs in head_scale mode.")
+    parser.add_argument("--default-threshold", type=float, default=0.0)
+    parser.add_argument("--random-seed", type=int, default=0)
+    parser.add_argument("--random-head-count", type=int, default=None)
     parser.add_argument("--min-new-token-step", type=int, default=0)
     parser.add_argument("--max-new-token-step", type=int, default=None)
     parser.add_argument("--num-samples", type=int, default=500)
     parser.add_argument("--beam", type=int, default=1)
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--custom-greedy",
+        action="store_true",
+        help="Use the replay-based greedy loop. Required internally for contrib_gated_ablate.",
+    )
     parser.add_argument("--save-every", type=int, default=25)
     return parser.parse_args()
 
 
-def load_selected_heads(path, head_set):
+def normalize_head(item, default_threshold=0.0):
+    out = {
+        "layer": int(item["layer"]),
+        "head": int(item["head"]),
+        "activation_threshold": float(item.get("activation_threshold", default_threshold)),
+    }
+    for key in ["selection_rank", "h_minus_g", "cohens_d_h_minus_g", "auc_hallucinated_high"]:
+        if key in item and item[key] is not None:
+            out[key] = item[key]
+    return out
+
+
+def load_selected_heads(path, head_set, random_seed=0, random_head_count=None, default_threshold=0.0):
     if not path:
         return []
     with open(path) as f:
         payload = json.load(f)
-    heads = payload.get(head_set, [])
+
+    if head_set == "random_heads":
+        references = payload.get("all_head_reference", [])
+        if not references:
+            references = payload.get("random_heads", [])
+        if not references:
+            return []
+        count = random_head_count or len(payload.get("wrong_heads", [])) or len(payload.get("support_heads", []))
+        rng = random.Random(random_seed)
+        references = list(references)
+        rng.shuffle(references)
+        heads = references[:count]
+    else:
+        heads = payload.get(head_set, [])
+
     out = []
     seen = set()
     for item in heads:
-        layer = int(item["layer"])
-        head = int(item["head"])
+        head_item = normalize_head(item, default_threshold=default_threshold)
+        layer = head_item["layer"]
+        head = head_item["head"]
         if (layer, head) in seen:
             continue
         seen.add((layer, head))
-        out.append({"layer": layer, "head": head})
+        out.append(head_item)
     return out
 
 
@@ -85,6 +122,13 @@ def group_heads_by_layer(heads):
     for item in heads:
         grouped.setdefault(int(item["layer"]), []).append(int(item["head"]))
     return {layer: sorted(set(heads)) for layer, heads in grouped.items()}
+
+
+def thresholds_by_head(heads):
+    return {
+        (int(item["layer"]), int(item["head"])): float(item.get("activation_threshold", 0.0))
+        for item in heads
+    }
 
 
 def step_is_active(kv_seq_len, prompt_len, min_step, max_step):
@@ -221,9 +265,118 @@ def install_head_intervention(model, heads, mode, alpha, head_scale, img_start_i
     return restore
 
 
+def model_forward_logits(model_manager, input_ids, images_tensor):
+    outputs = model_manager.llm_model(
+        input_ids=input_ids,
+        images=images_tensor,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    return outputs.logits[:, -1, :]
+
+
+def measure_selected_head_contrib(model_manager, input_ids, images_tensor, target_token_id, heads):
+    trace_store, restore = install_head_logit_tracer(model_manager.llm_model, [int(target_token_id)])
+    try:
+        with torch.inference_mode():
+            _ = model_manager.llm_model(
+                input_ids=input_ids,
+                images=images_tensor,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+    finally:
+        restore()
+
+    active = []
+    contribs = {}
+    thresholds = thresholds_by_head(heads)
+    for item in heads:
+        layer = int(item["layer"])
+        head = int(item["head"])
+        if layer not in trace_store:
+            continue
+        value = float(trace_store[layer][head, 0].item())
+        threshold = thresholds[(layer, head)]
+        contribs[f"{layer}.{head}"] = value
+        if value > threshold:
+            active.append({
+                "layer": layer,
+                "head": head,
+                "activation_threshold": threshold,
+                "activation_value": value,
+            })
+    return active, contribs
+
+
+def custom_greedy_generate(model_manager, input_ids, images_tensor, args, selected_heads):
+    generated = input_ids.clone()
+    prompt_len = int(input_ids.shape[1])
+    eos_token_id = model_manager.tokenizer.eos_token_id
+    gated_steps = []
+
+    for step in range(int(args.max_tokens)):
+        with torch.inference_mode():
+            logits = model_forward_logits(model_manager, generated, images_tensor)
+        vanilla_token = int(torch.argmax(logits[0], dim=-1).item())
+        next_token = vanilla_token
+
+        gated_active = (
+            args.mode == "contrib_gated_ablate"
+            and step >= int(args.min_new_token_step)
+            and (args.max_new_token_step is None or step <= int(args.max_new_token_step))
+        )
+        if gated_active and selected_heads:
+            active_heads, _ = measure_selected_head_contrib(
+                model_manager,
+                generated,
+                images_tensor,
+                vanilla_token,
+                selected_heads,
+            )
+            if active_heads:
+                restore = install_head_intervention(
+                    model_manager.llm_model,
+                    active_heads,
+                    "head_scale",
+                    args.alpha,
+                    0.0,
+                    model_manager.img_start_idx,
+                    model_manager.img_end_idx,
+                    prompt_len,
+                    step,
+                    step,
+                )
+                try:
+                    with torch.inference_mode():
+                        ablated_logits = model_forward_logits(model_manager, generated, images_tensor)
+                    next_token = int(torch.argmax(ablated_logits[0], dim=-1).item())
+                finally:
+                    restore()
+                gated_steps.append({
+                    "step": step,
+                    "vanilla_token": vanilla_token,
+                    "ablated_token": next_token,
+                    "num_active_heads": len(active_heads),
+                })
+
+        token_tensor = torch.tensor([[next_token]], dtype=generated.dtype, device=generated.device)
+        generated = torch.cat([generated, token_tensor], dim=1)
+        if eos_token_id is not None and next_token == int(eos_token_id):
+            break
+
+    return generated, gated_steps
+
+
 def variant_name(args):
     if args.variant_name:
         return args.variant_name
+    if args.mode == "contrib_gated_ablate":
+        return f"{args.head_set}_contrib_gated_ablate_seed{args.random_seed}"
     if args.mode == "none":
         return "baseline"
     step_part = f"steps{args.min_new_token_step}"
@@ -261,7 +414,13 @@ def main():
     if args.num_samples is not None:
         instructions = instructions[: args.num_samples]
 
-    selected_heads = load_selected_heads(args.heads_json, args.head_set)
+    selected_heads = load_selected_heads(
+        args.heads_json,
+        args.head_set,
+        random_seed=args.random_seed,
+        random_head_count=args.random_head_count,
+        default_threshold=args.default_threshold,
+    )
     if args.mode != "none" and not selected_heads:
         raise ValueError(f"No heads loaded for {args.head_set}; pass --heads-json or use --mode none.")
 
@@ -287,33 +446,45 @@ def main():
             use_dataloader=False,
         )
 
-        restore = install_head_intervention(
-            model_manager.llm_model,
-            selected_heads,
-            args.mode,
-            args.alpha,
-            args.head_scale,
-            model_manager.img_start_idx,
-            model_manager.img_end_idx,
-            input_ids.shape[1],
-            args.min_new_token_step,
-            args.max_new_token_step,
-        )
-        try:
-            with torch.inference_mode():
-                output_ids = model_manager.llm_model.generate(
-                    input_ids,
-                    do_sample=args.sample,
-                    num_beams=args.beam,
-                    max_new_tokens=args.max_tokens,
-                    use_cache=True,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict_in_generate=False,
-                    **kwargs,
-                )
-        finally:
-            restore()
+        gated_steps = []
+        if args.mode == "contrib_gated_ablate" or args.custom_greedy:
+            if args.sample or args.beam != 1:
+                raise ValueError("--custom-greedy/contrib_gated_ablate supports only greedy decoding: --beam 1 without --sample.")
+            output_ids, gated_steps = custom_greedy_generate(
+                model_manager,
+                input_ids,
+                kwargs["images"],
+                args,
+                selected_heads,
+            )
+        else:
+            restore = install_head_intervention(
+                model_manager.llm_model,
+                selected_heads,
+                args.mode,
+                args.alpha,
+                args.head_scale,
+                model_manager.img_start_idx,
+                model_manager.img_end_idx,
+                input_ids.shape[1],
+                args.min_new_token_step,
+                args.max_new_token_step,
+            )
+            try:
+                with torch.inference_mode():
+                    output_ids = model_manager.llm_model.generate(
+                        input_ids,
+                        do_sample=args.sample,
+                        num_beams=args.beam,
+                        max_new_tokens=args.max_tokens,
+                        use_cache=True,
+                        output_attentions=False,
+                        output_hidden_states=False,
+                        return_dict_in_generate=False,
+                        **kwargs,
+                    )
+            finally:
+                restore()
 
         caption = model_manager.decode(output_ids)[0]
         caption_records.append({
@@ -322,6 +493,8 @@ def main():
             "variant": name,
             "mode": args.mode,
             "head_set": args.head_set if args.mode != "none" else "",
+            "num_gated_steps": len(gated_steps),
+            "gated_steps": gated_steps[:20],
         })
 
         if args.save_every > 0 and (idx + 1) % args.save_every == 0:
@@ -344,6 +517,7 @@ def main():
         "num_captions": len(caption_records),
         "num_heads": len(selected_heads) if args.mode != "none" else 0,
         "selected_heads": selected_heads,
+        "total_gated_steps": int(sum(record.get("num_gated_steps", 0) for record in caption_records)),
         "overall_metrics": chair_output["overall_metrics"],
         "outputs": {
             "captions": str(caption_path),
