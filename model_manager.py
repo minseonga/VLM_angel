@@ -3,6 +3,7 @@ Modified from: https://github.com/LALBJ/PAI/blob/master/model_loader.py
 '''
 
 
+import json
 import os
 import torch
 from constants import (
@@ -24,6 +25,11 @@ def load_llava_model(model_path):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     model_name = get_model_name_from_path(model_path)
+    config_path = os.path.join(model_path, "config.json")
+    if "llava" not in model_name.lower() and os.path.exists(config_path):
+        with open(config_path) as f:
+            config = json.load(f)
+        model_name = config.get("_name_or_path", model_name)
     model_base = None
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path, model_base, model_name,
