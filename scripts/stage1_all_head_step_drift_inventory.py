@@ -276,6 +276,24 @@ def compact_head_row(row):
     return {key: row.get(key) for key in keys if key in row}
 
 
+def head_set_entry(row):
+    return {
+        "layer": int(row["layer"]),
+        "head": int(row["head"]),
+        "source_rank": int(row.get("rank", 0)),
+        "source_score_name": row.get("score_name", ""),
+        "all_late_minus_early": row.get("all_late_minus_early"),
+        "all_cohen_d_late_vs_early": row.get("all_cohen_d_late_vs_early"),
+        "pearson_step_corr": row.get("pearson_step_corr"),
+        "lc_grounded_late_minus_early": row.get("lc_grounded_late_minus_early"),
+        "lc_hallucinated_late_minus_early": row.get("lc_hallucinated_late_minus_early"),
+        "lc_hall_specific_drift": row.get("lc_hall_specific_drift"),
+        "lc_generic_positive_drift": row.get("lc_generic_positive_drift"),
+        "lc_grounded_risk": row.get("lc_grounded_risk"),
+        "activation_threshold": 0.0,
+    }
+
+
 def head_key(row):
     return (int(row["layer"]), int(row["head"]))
 
@@ -779,6 +797,37 @@ def main():
             args.top_k,
         ),
     }
+    head_sets = {
+        "config": vars(args),
+        "source": args.contrib_file,
+        "description": (
+            "All-head step-sensitive candidate sets selected from contribution drift. "
+            "D1 heads are not used for selection."
+        ),
+        "all_head_reference": [
+            {"layer": int(layer), "head": int(head), "activation_threshold": 0.0}
+            for layer in layer_range
+            for head in range(num_heads)
+        ],
+        "step_abs_drift_heads": [
+            head_set_entry(row) for row in top_lists["top_abs_contrib_cohen_d"]
+        ],
+        "step_corr_heads": [
+            head_set_entry(row) for row in top_lists["top_abs_step_corr"]
+        ],
+        "step_positive_heads": [
+            head_set_entry(row) for row in top_lists["top_positive_contrib_late_minus_early"]
+        ],
+        "label_cond_hall_specific_heads": [
+            head_set_entry(row) for row in top_lists["top_lc_hall_specific_drift"]
+        ],
+        "label_cond_generic_late_heads": [
+            head_set_entry(row) for row in top_lists["top_lc_generic_positive_drift"]
+        ],
+        "label_cond_grounded_risk_heads": [
+            head_set_entry(row) for row in top_lists["top_lc_grounded_risk"]
+        ],
+    }
 
     overlap_rows = [
         overlap_summary(name, top_rows, d1_selected)
@@ -854,6 +903,10 @@ def main():
             },
         },
         "top_lists": top_lists,
+        "head_set_keys": [
+            key for key in head_sets
+            if key.endswith("_heads")
+        ],
         "d1_overlap_summary": overlap_rows,
         "d1_rank_summaries": rank_summaries,
         "plots": plot_paths,
@@ -862,6 +915,7 @@ def main():
             "all_metric_inventory": str(output_dir / "stage1_all_head_step_drift_all_metrics.csv"),
             "bin_profile": str(output_dir / "stage1_all_head_step_drift_bin_profile.csv"),
             "top_heads": str(output_dir / "stage1_all_head_step_drift_top_heads.json"),
+            "head_sets": str(output_dir / "stage1_all_head_step_drift_head_sets.json"),
             "overlap": str(output_dir / "stage1_all_head_step_drift_d1_overlap.csv"),
             "summary": str(output_dir / "stage1_all_head_step_drift_summary.json"),
         },
@@ -874,6 +928,8 @@ def main():
     write_csv(csv_safe_rows(rank_summaries), output_dir / "stage1_all_head_step_drift_d1_rank_summaries.csv")
     with open(output_dir / "stage1_all_head_step_drift_top_heads.json", "w") as f:
         json.dump(top_lists, f, indent=2)
+    with open(output_dir / "stage1_all_head_step_drift_head_sets.json", "w") as f:
+        json.dump(head_sets, f, indent=2)
     with open(output_dir / "stage1_all_head_step_drift_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -897,6 +953,7 @@ def main():
         },
         "label_conditional_windows": summary["label_conditional_windows"],
         "d1_overlap_summary": overlap_rows,
+        "head_set_keys": summary["head_set_keys"],
         "top_heads_preview": {
             name: heads[:5]
             for name, heads in top_lists.items()

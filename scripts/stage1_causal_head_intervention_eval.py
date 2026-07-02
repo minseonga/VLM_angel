@@ -44,8 +44,9 @@ def parse_args():
     parser.add_argument("--heads-json", type=str, default=None)
     parser.add_argument(
         "--head-set",
-        choices=["wrong_heads", "support_heads", "prior_heads", "random_heads"],
+        type=str,
         default="wrong_heads",
+        help="Top-level head-list key in --heads-json, or random_heads for a random control.",
     )
     parser.add_argument(
         "--mode",
@@ -102,6 +103,14 @@ def load_selected_heads(path, head_set, random_seed=0, random_head_count=None, d
         if not references:
             return []
         count = random_head_count or len(payload.get("wrong_heads", [])) or len(payload.get("support_heads", []))
+        if not count:
+            for key, value in payload.items():
+                if key == "random_heads" or key == "all_head_reference":
+                    continue
+                if key.endswith("_heads") and isinstance(value, list) and value:
+                    count = len(value)
+                    break
+        count = count or len(references)
         rng = random.Random(random_seed)
         references = list(references)
         rng.shuffle(references)
