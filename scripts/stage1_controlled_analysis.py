@@ -234,6 +234,105 @@ def token_step_bucket_analysis(rows, metrics, num_bins, min_class_count, bootstr
     }
 
 
+def summarize_score_rows(rows, score_key, score_label, score_group, bootstrap_iters, rng):
+    cur_rows = valid_metric_rows(rows, score_key)
+    if not cur_rows:
+        return None
+    labels = labels_hallucinated(cur_rows)
+    scores = metric_scores(cur_rows, score_key)
+    if len(np.unique(labels)) < 2:
+        return None
+
+    grounded = scores[labels == 0]
+    hallucinated = scores[labels == 1]
+    auc_info = bootstrap_auc_ci(labels, scores, bootstrap_iters, rng)
+    auc = auc_info["auc"]
+    return {
+        "score": score_label,
+        "score_key": score_key,
+        "score_group": score_group,
+        "grounded_mean": float(grounded.mean()),
+        "hallucinated_mean": float(hallucinated.mean()),
+        "h_minus_g": float(hallucinated.mean() - grounded.mean()),
+        "auc_hallucinated_high": auc,
+        "auc_hallucinated_high_ci95": auc_info["ci95"],
+        "oriented_auc": max(auc, 1.0 - auc) if auc is not None else None,
+        "n_boot": auc_info["n_boot"],
+    }
+
+
+def token_step_auc_distribution(rows, metrics, num_bins, min_class_count, bootstrap_iters, rng):
+    score_specs = [
+        ("svar", "svar", "baseline"),
+        ("token_step", "token_step", "baseline"),
+    ] + [(metric, metric, "head_metric") for metric in metrics]
+
+    auc_rows = []
+    buckets = token_step_bucket_rows(rows, num_bins)
+    for bucket in buckets:
+        bucket_rows = bucket["rows"]
+        grounded = int(sum(int(row["label"]) == 1 for row in bucket_rows))
+        hallucinated = int(sum(int(row["label"]) == 0 for row in bucket_rows))
+        n = grounded + hallucinated
+        token_steps = np.array([float(row["token_step"]) for row in bucket_rows], dtype=np.float64)
+        base = {
+            "bucket": bucket["bucket"],
+            "token_step_lo": bucket["lo"],
+            "token_step_hi": bucket["hi"],
+            "token_step_mean": float(token_steps.mean()) if len(token_steps) else None,
+            "n": n,
+            "grounded_n": grounded,
+            "hallucinated_n": hallucinated,
+            "hallucination_rate": float(hallucinated / n) if n else None,
+            "valid_for_auc": bool(grounded >= min_class_count and hallucinated >= min_class_count),
+        }
+        if grounded < min_class_count or hallucinated < min_class_count:
+            auc_rows.append({**base, "score": "", "score_key": "", "score_group": "", "skip_reason": "insufficient_class_count"})
+            continue
+
+        for score_key, score_label, score_group in score_specs:
+            summary = summarize_score_rows(bucket_rows, score_key, score_label, score_group, bootstrap_iters, rng)
+            if summary is None:
+                continue
+            row = {**base, **summary}
+            ci = row.pop("auc_hallucinated_high_ci95", None)
+            row["auc_ci95_low"] = ci[0] if ci else None
+            row["auc_ci95_high"] = ci[1] if ci else None
+            auc_rows.append(row)
+
+    by_score = {}
+    score_names = sorted({row.get("score") for row in auc_rows if row.get("score")})
+    for score in score_names:
+        rows_for_score = [
+            row for row in auc_rows
+            if row.get("score") == score and row.get("auc_hallucinated_high") is not None
+        ]
+        auc_vals = np.array([float(row["auc_hallucinated_high"]) for row in rows_for_score], dtype=np.float64)
+        oriented_vals = np.array([float(row["oriented_auc"]) for row in rows_for_score], dtype=np.float64)
+        if len(auc_vals) == 0:
+            continue
+        by_score[score] = {
+            "num_valid_bins": int(len(auc_vals)),
+            "mean_auc_hallucinated_high": float(auc_vals.mean()),
+            "std_auc_hallucinated_high": float(auc_vals.std()),
+            "q10_auc_hallucinated_high": float(np.quantile(auc_vals, 0.10)),
+            "q50_auc_hallucinated_high": float(np.quantile(auc_vals, 0.50)),
+            "q90_auc_hallucinated_high": float(np.quantile(auc_vals, 0.90)),
+            "mean_oriented_auc": float(oriented_vals.mean()),
+            "std_oriented_auc": float(oriented_vals.std()),
+            "q10_oriented_auc": float(np.quantile(oriented_vals, 0.10)),
+            "q50_oriented_auc": float(np.quantile(oriented_vals, 0.50)),
+            "q90_oriented_auc": float(np.quantile(oriented_vals, 0.90)),
+        }
+
+    return {
+        "num_bins": num_bins,
+        "min_bucket_class_count": min_class_count,
+        "rows": auc_rows,
+        "by_score": by_score,
+    }
+
+
 def svar_bin_analysis(rows, metrics, num_bins, min_class_count, bootstrap_iters, rng):
     svar = np.array([float(row["svar"]) for row in rows], dtype=np.float64)
     if len(svar) == 0:
@@ -640,6 +739,14 @@ def main():
         args.bootstrap_iters,
         rng,
     )
+    token_step_auc = token_step_auc_distribution(
+        rows,
+        args.metrics,
+        args.token_step_bins,
+        args.min_bucket_class_count,
+        args.bootstrap_iters,
+        rng,
+    )
     svar_bins = svar_bin_analysis(
         rows,
         args.metrics,
@@ -685,6 +792,7 @@ def main():
         "bootstrap_iters": args.bootstrap_iters,
         "raw_metric_summary": raw_summary,
         "token_step_bucket_analysis": token_step,
+        "token_step_auc_distribution": token_step_auc,
         "svar_bin_analysis": svar_bins,
         "svar_matched_analysis": matched_svar,
         "svar_token_step_matched_analysis": matched_svar_token,
@@ -697,6 +805,17 @@ def main():
 
     raw_rows = [v for v in raw_summary.values()]
     write_csv(csv_safe_rows(raw_rows), output_dir / "stage1_controlled_raw_metric_summary.csv")
+    write_csv(
+        csv_safe_rows(token_step_auc["rows"]),
+        output_dir / "stage1_controlled_token_step_bin_auc_distribution.csv",
+    )
+    write_csv(
+        csv_safe_rows([
+            {"score": score, **stats}
+            for score, stats in token_step_auc["by_score"].items()
+        ]),
+        output_dir / "stage1_controlled_token_step_bin_auc_summary.csv",
+    )
 
     match_rows = []
     for metric, stats in matched_svar["metrics"].items():
@@ -732,6 +851,22 @@ def main():
         )[:5],
         "svar_matched_pairs": matched_svar["num_pairs"],
         "svar_token_step_matched_pairs": None if matched_svar_token is None else matched_svar_token["num_pairs"],
+        "token_step_bin_auc_top": sorted(
+            [
+                {
+                    "score": score,
+                    "num_valid_bins": stats.get("num_valid_bins"),
+                    "mean_oriented_auc": stats.get("mean_oriented_auc"),
+                    "std_oriented_auc": stats.get("std_oriented_auc"),
+                    "q10_oriented_auc": stats.get("q10_oriented_auc"),
+                    "q90_oriented_auc": stats.get("q90_oriented_auc"),
+                }
+                for score, stats in token_step_auc["by_score"].items()
+                if stats.get("mean_oriented_auc") is not None
+            ],
+            key=lambda item: item["mean_oriented_auc"],
+            reverse=True,
+        )[:8],
         "baseline_control_auc": {
             "raw_svar": baseline_control["raw_auc"].get("svar"),
             "raw_token_step": baseline_control["raw_auc"].get("token_step"),
@@ -758,6 +893,8 @@ def main():
         "outputs": {
             "summary": str(output_dir / "stage1_controlled_analysis_summary.json"),
             "raw_csv": str(output_dir / "stage1_controlled_raw_metric_summary.csv"),
+            "token_step_bin_auc_csv": str(output_dir / "stage1_controlled_token_step_bin_auc_distribution.csv"),
+            "token_step_bin_auc_summary_csv": str(output_dir / "stage1_controlled_token_step_bin_auc_summary.csv"),
             "matched_csv": str(output_dir / "stage1_controlled_matched_metric_summary.csv"),
         },
     }, indent=2))
