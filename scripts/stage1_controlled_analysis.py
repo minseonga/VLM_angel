@@ -373,6 +373,141 @@ def standardize_train_test(X):
     return (X - mean) / std
 
 
+def quantile_label_profile(rows, key, num_bins):
+    vals = np.array([float(row[key]) for row in rows], dtype=np.float64)
+    if len(vals) == 0:
+        return []
+    quantiles = np.quantile(vals, np.linspace(0, 1, num_bins + 1))
+    quantiles[0] = -np.inf
+    quantiles[-1] = np.inf
+
+    out = []
+    for idx in range(num_bins):
+        lo = quantiles[idx]
+        hi = quantiles[idx + 1]
+        bucket = [
+            row for row in rows
+            if float(row[key]) > lo and float(row[key]) <= hi
+        ]
+        grounded = int(sum(int(row["label"]) == 1 for row in bucket))
+        hallucinated = int(sum(int(row["label"]) == 0 for row in bucket))
+        n = grounded + hallucinated
+        key_vals = np.array([float(row[key]) for row in bucket], dtype=np.float64)
+        out.append({
+            "bucket": idx,
+            f"{key}_lo": None if np.isneginf(lo) else float(lo),
+            f"{key}_hi": None if np.isposinf(hi) else float(hi),
+            "n": n,
+            "grounded_n": grounded,
+            "hallucinated_n": hallucinated,
+            "hallucination_rate": float(hallucinated / n) if n else None,
+            f"{key}_mean": float(key_vals.mean()) if len(key_vals) else None,
+        })
+    return out
+
+
+def logistic_auc_for_features(rows, feature_keys, bootstrap_iters, rng):
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.exceptions import ConvergenceWarning
+        import warnings
+    except Exception as exc:
+        return {"error": f"sklearn unavailable: {exc}"}
+
+    y = labels_hallucinated(rows)
+    if len(np.unique(y)) < 2:
+        return None
+    X = np.array([
+        [float(row[key]) for key in feature_keys]
+        for row in rows
+    ], dtype=np.float64)
+    X = standardize_train_test(X)
+
+    def fit_score(indices):
+        x_i = X[indices]
+        y_i = y[indices]
+        if len(np.unique(y_i)) < 2:
+            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            clf = LogisticRegression(max_iter=1000, solver="liblinear")
+            clf.fit(x_i, y_i)
+        prob = clf.predict_proba(x_i)[:, 1]
+        return {
+            "coef": [float(x) for x in clf.coef_[0]],
+            "auc_in_sample": binary_auc(y_i, prob),
+        }
+
+    base = fit_score(np.arange(len(y)))
+    if base is None:
+        return None
+
+    boot_auc = []
+    for _ in range(bootstrap_iters):
+        idx = rng.integers(0, len(y), size=len(y))
+        cur = fit_score(idx)
+        if cur is not None and cur["auc_in_sample"] is not None:
+            boot_auc.append(cur["auc_in_sample"])
+
+    return {
+        "features": list(feature_keys),
+        "coef": base["coef"],
+        "auc_in_sample": base["auc_in_sample"],
+        "auc_in_sample_ci95": [
+            float(np.quantile(boot_auc, 0.025)),
+            float(np.quantile(boot_auc, 0.975)),
+        ] if boot_auc else None,
+        "n_boot": int(len(boot_auc)),
+    }
+
+
+def baseline_control_analysis(rows, num_bins, bootstrap_iters, rng):
+    labels = labels_hallucinated(rows)
+    out = {
+        "raw_auc": {},
+        "logistic_auc": {},
+        "label_profiles": {
+            "token_step": quantile_label_profile(rows, "token_step", num_bins),
+            "svar": quantile_label_profile(rows, "svar", num_bins),
+        },
+    }
+
+    for key in ["svar", "token_step"]:
+        scores = np.array([float(row[key]) for row in rows], dtype=np.float64)
+        auc_info = bootstrap_auc_ci(labels, scores, bootstrap_iters, rng)
+        auc = auc_info["auc"]
+        out["raw_auc"][key] = {
+            "auc_hallucinated_high": auc,
+            "auc_hallucinated_high_ci95": auc_info["ci95"],
+            "oriented_auc": max(auc, 1.0 - auc) if auc is not None else None,
+            "n_boot": auc_info["n_boot"],
+        }
+
+    for name, feature_keys in [
+        ("svar_only", ["svar"]),
+        ("token_step_only", ["token_step"]),
+        ("svar_token_step", ["svar", "token_step"]),
+    ]:
+        out["logistic_auc"][name] = logistic_auc_for_features(
+            rows,
+            feature_keys,
+            bootstrap_iters,
+            rng,
+        )
+
+    both = out["logistic_auc"].get("svar_token_step")
+    svar = out["logistic_auc"].get("svar_only")
+    step = out["logistic_auc"].get("token_step_only")
+    if isinstance(both, dict):
+        both_auc = both.get("auc_in_sample")
+        if isinstance(svar, dict) and both_auc is not None and svar.get("auc_in_sample") is not None:
+            out["delta_vs_svar_only"] = float(both_auc - svar["auc_in_sample"])
+        if isinstance(step, dict) and both_auc is not None and step.get("auc_in_sample") is not None:
+            out["delta_vs_token_step_only"] = float(both_auc - step["auc_in_sample"])
+
+    return out
+
+
 def logistic_control_analysis(rows, metrics, bootstrap_iters, rng):
     try:
         from sklearn.linear_model import LogisticRegression
@@ -532,6 +667,12 @@ def main():
             rng,
         )
 
+    baseline_control = baseline_control_analysis(
+        rows,
+        args.token_step_bins,
+        args.bootstrap_iters,
+        rng,
+    )
     logistic = logistic_control_analysis(rows, args.metrics, args.bootstrap_iters, rng)
 
     summary = {
@@ -547,6 +688,7 @@ def main():
         "svar_bin_analysis": svar_bins,
         "svar_matched_analysis": matched_svar,
         "svar_token_step_matched_analysis": matched_svar_token,
+        "baseline_control_analysis": baseline_control,
         "logistic_control_analysis": logistic,
     }
 
@@ -590,6 +732,15 @@ def main():
         )[:5],
         "svar_matched_pairs": matched_svar["num_pairs"],
         "svar_token_step_matched_pairs": None if matched_svar_token is None else matched_svar_token["num_pairs"],
+        "baseline_control_auc": {
+            "raw_svar": baseline_control["raw_auc"].get("svar"),
+            "raw_token_step": baseline_control["raw_auc"].get("token_step"),
+            "logistic_svar_only": baseline_control["logistic_auc"].get("svar_only"),
+            "logistic_token_step_only": baseline_control["logistic_auc"].get("token_step_only"),
+            "logistic_svar_token_step": baseline_control["logistic_auc"].get("svar_token_step"),
+            "delta_vs_svar_only": baseline_control.get("delta_vs_svar_only"),
+            "delta_vs_token_step_only": baseline_control.get("delta_vs_token_step_only"),
+        },
         "logistic_delta_auc": sorted(
             [
                 {
