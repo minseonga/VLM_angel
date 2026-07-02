@@ -14,8 +14,21 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-DEFAULT_IMAGE_ROOT = "/home/kms/data/pope/val2014"
-DEFAULT_ANNOTATION_DIR = "/home/kms/data/images/mscoco/annotations"
+def first_existing_path(*paths):
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    return paths[0]
+
+
+DEFAULT_IMAGE_ROOT = first_existing_path(
+    "/mnt/pilab_nas/homes/mskang/data/val2014",
+    "/home/kms/data/pope/val2014",
+)
+DEFAULT_ANNOTATION_DIR = first_existing_path(
+    "/mnt/pilab_nas/homes/mskang/data/annotations",
+    "/home/kms/data/images/mscoco/annotations",
+)
 DEFAULT_INSTRUCTION_PATH = str(REPO_ROOT / "examples" / "toy_img_query_list.jsonl")
 
 

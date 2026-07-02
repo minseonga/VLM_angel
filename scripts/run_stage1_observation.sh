@@ -3,8 +3,18 @@ set -euo pipefail
 
 : "${LLAVA_MODEL_PATH:?Set LLAVA_MODEL_PATH to the LLaVA-1.5 checkpoint path or HF id.}"
 
-IMAGE_FOLDER="${IMAGE_FOLDER:-/home/kms/data/pope/val2014}"
-ANNOTATION_DIR="${ANNOTATION_DIR:-/home/kms/data/images/mscoco/annotations}"
+pick_existing_path() {
+  for path in "$@"; do
+    if [[ -e "${path}" ]]; then
+      printf '%s' "${path}"
+      return
+    fi
+  done
+  printf '%s' "$1"
+}
+
+IMAGE_FOLDER="${IMAGE_FOLDER:-$(pick_existing_path /mnt/pilab_nas/homes/mskang/data/val2014 /home/kms/data/pope/val2014)}"
+ANNOTATION_DIR="${ANNOTATION_DIR:-$(pick_existing_path /mnt/pilab_nas/homes/mskang/data/annotations /home/kms/data/images/mscoco/annotations)}"
 INSTRUCTION_PATH="${INSTRUCTION_PATH:-examples/toy_img_query_list.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-stage1_outputs}"
 NUM_SAMPLES="${NUM_SAMPLES:-500}"
