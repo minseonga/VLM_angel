@@ -36,6 +36,12 @@ def parse_args():
     parser.add_argument("--target-index", type=int, default=0)
     parser.add_argument("--early-frac", type=float, default=0.25)
     parser.add_argument("--late-frac", type=float, default=0.25)
+    parser.add_argument(
+        "--label-conditional-frac",
+        type=float,
+        default=0.25,
+        help="Within-label early/late fraction for H-vs-G drift specificity.",
+    )
     parser.add_argument("--token-step-bins", type=int, default=30)
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--min-group-count", type=int, default=5)
@@ -176,6 +182,43 @@ def make_early_late_masks(steps, early_frac, late_frac):
     return early_cut, late_cut, early_mask, late_mask
 
 
+def quantile_masks_for_subset(steps, subset_mask, frac):
+    subset_steps = steps[subset_mask]
+    if len(subset_steps) == 0:
+        empty = np.zeros_like(subset_mask, dtype=bool)
+        return None, None, empty, empty
+    early_cut = float(np.quantile(subset_steps, frac))
+    late_cut = float(np.quantile(subset_steps, 1.0 - frac))
+    early_mask = subset_mask & (steps <= early_cut)
+    late_mask = subset_mask & (steps >= late_cut)
+    return early_cut, late_cut, early_mask, late_mask
+
+
+def make_label_conditional_masks(steps, labels, frac):
+    grounded_mask = labels == 1
+    hallucinated_mask = labels == 0
+    g_early_cut, g_late_cut, g_early_mask, g_late_mask = quantile_masks_for_subset(
+        steps,
+        grounded_mask,
+        frac,
+    )
+    h_early_cut, h_late_cut, h_early_mask, h_late_mask = quantile_masks_for_subset(
+        steps,
+        hallucinated_mask,
+        frac,
+    )
+    return {
+        "grounded_early_cut": g_early_cut,
+        "grounded_late_cut": g_late_cut,
+        "grounded_early_mask": g_early_mask,
+        "grounded_late_mask": g_late_mask,
+        "hallucinated_early_cut": h_early_cut,
+        "hallucinated_late_cut": h_late_cut,
+        "hallucinated_early_mask": h_early_mask,
+        "hallucinated_late_mask": h_late_mask,
+    }
+
+
 def score_or_neg_inf(row, key):
     value = row.get(key)
     if value is None or value == "":
@@ -221,6 +264,12 @@ def compact_head_row(row):
         "generic_positive_drift",
         "generic_abs_same_direction_drift",
         "grounded_risk",
+        "lc_grounded_late_minus_early",
+        "lc_hallucinated_late_minus_early",
+        "lc_hall_specific_drift",
+        "lc_generic_positive_drift",
+        "lc_generic_abs_same_direction_drift",
+        "lc_grounded_risk",
         "d1_selection_rank",
         "d1_selection_score",
     ]
@@ -491,6 +540,30 @@ def write_plots(primary_rows, output_dir):
         p2,
     ):
         paths.append(str(p2))
+
+    p3 = plot_dir / "head_label_cond_grounded_vs_hallucinated.svg"
+    if svg_scatter(
+        primary_rows,
+        "lc_grounded_late_minus_early",
+        "lc_hallucinated_late_minus_early",
+        "Label-conditional drift: grounded vs hallucinated",
+        "D_G within grounded = late - early",
+        "D_H within hallucinated = late - early",
+        p3,
+    ):
+        paths.append(str(p3))
+
+    p4 = plot_dir / "head_step_drift_vs_label_cond_specificity.svg"
+    if svg_scatter(
+        primary_rows,
+        "all_late_minus_early",
+        "lc_hall_specific_drift",
+        "Step drift vs label-conditional hallucination specificity",
+        "D_all = global late - early contribution",
+        "D_H(label-conditional) - D_G(label-conditional)",
+        p4,
+    ):
+        paths.append(str(p4))
     return paths
 
 
@@ -500,6 +573,8 @@ def main():
         raise ValueError("--early-frac and --late-frac must be in (0, 1).")
     if args.early_frac + args.late_frac >= 1:
         raise ValueError("--early-frac + --late-frac must be < 1.")
+    if not (0 < args.label_conditional_frac < 0.5):
+        raise ValueError("--label-conditional-frac must be in (0, 0.5).")
     if args.token_step_bins < 2:
         raise ValueError("--token-step-bins must be >= 2.")
 
@@ -528,6 +603,7 @@ def main():
         args.early_frac,
         args.late_frac,
     )
+    label_cond = make_label_conditional_masks(steps, labels, args.label_conditional_frac)
 
     metrics = ["contrib", "positive_contrib", "negative_contrib", "abs_contrib"]
     rows = []
@@ -539,6 +615,18 @@ def main():
                 all_gap = gap_stats(values, early_mask, late_mask, args.min_group_count)
                 g_gap = gap_stats(values, early_mask & (labels == 1), late_mask & (labels == 1), args.min_group_count)
                 h_gap = gap_stats(values, early_mask & (labels == 0), late_mask & (labels == 0), args.min_group_count)
+                lc_g_gap = gap_stats(
+                    values,
+                    label_cond["grounded_early_mask"],
+                    label_cond["grounded_late_mask"],
+                    args.min_group_count,
+                )
+                lc_h_gap = gap_stats(
+                    values,
+                    label_cond["hallucinated_early_mask"],
+                    label_cond["hallucinated_late_mask"],
+                    args.min_group_count,
+                )
 
                 all_lme = all_gap["late_minus_early"]
                 grounded_lme = g_gap["late_minus_early"]
@@ -546,6 +634,13 @@ def main():
                 hall_specific = (
                     float(hallucinated_lme - grounded_lme)
                     if hallucinated_lme is not None and grounded_lme is not None
+                    else None
+                )
+                lc_grounded_lme = lc_g_gap["late_minus_early"]
+                lc_hallucinated_lme = lc_h_gap["late_minus_early"]
+                lc_hall_specific = (
+                    float(lc_hallucinated_lme - lc_grounded_lme)
+                    if lc_hallucinated_lme is not None and lc_grounded_lme is not None
                     else None
                 )
 
@@ -562,6 +657,19 @@ def main():
                         generic_abs_same = float(min(abs(hallucinated_lme), abs(grounded_lme)))
                     else:
                         generic_abs_same = 0.0
+                lc_generic_positive = None
+                lc_generic_abs_same = None
+                if lc_hallucinated_lme is not None and lc_grounded_lme is not None:
+                    if lc_hallucinated_lme > 0 and lc_grounded_lme > 0:
+                        lc_generic_positive = float(min(lc_hallucinated_lme, lc_grounded_lme))
+                    else:
+                        lc_generic_positive = 0.0
+                    if lc_hallucinated_lme == 0 or lc_grounded_lme == 0:
+                        lc_generic_abs_same = 0.0
+                    elif math.copysign(1.0, lc_hallucinated_lme) == math.copysign(1.0, lc_grounded_lme):
+                        lc_generic_abs_same = float(min(abs(lc_hallucinated_lme), abs(lc_grounded_lme)))
+                    else:
+                        lc_generic_abs_same = 0.0
 
                 key = (layer, head)
                 row = {
@@ -594,6 +702,22 @@ def main():
                     "generic_positive_drift": generic_positive,
                     "generic_abs_same_direction_drift": generic_abs_same,
                     "grounded_risk": grounded_lme,
+                    "lc_grounded_early_n": lc_g_gap["early_n"],
+                    "lc_grounded_late_n": lc_g_gap["late_n"],
+                    "lc_grounded_early_mean": lc_g_gap["early_mean"],
+                    "lc_grounded_late_mean": lc_g_gap["late_mean"],
+                    "lc_grounded_late_minus_early": lc_grounded_lme,
+                    "lc_grounded_cohen_d_late_vs_early": lc_g_gap["cohen_d_late_vs_early"],
+                    "lc_hallucinated_early_n": lc_h_gap["early_n"],
+                    "lc_hallucinated_late_n": lc_h_gap["late_n"],
+                    "lc_hallucinated_early_mean": lc_h_gap["early_mean"],
+                    "lc_hallucinated_late_mean": lc_h_gap["late_mean"],
+                    "lc_hallucinated_late_minus_early": lc_hallucinated_lme,
+                    "lc_hallucinated_cohen_d_late_vs_early": lc_h_gap["cohen_d_late_vs_early"],
+                    "lc_hall_specific_drift": lc_hall_specific,
+                    "lc_generic_positive_drift": lc_generic_positive,
+                    "lc_generic_abs_same_direction_drift": lc_generic_abs_same,
+                    "lc_grounded_risk": lc_grounded_lme,
                 }
                 row.update(d1_meta.get(key, {}))
                 rows.append(row)
@@ -636,6 +760,24 @@ def main():
             lambda row: score_or_neg_inf(row, "grounded_risk"),
             args.top_k,
         ),
+        "top_lc_hall_specific_drift": rank_rows(
+            primary_rows,
+            "lc_hall_specific_drift",
+            lambda row: score_or_neg_inf(row, "lc_hall_specific_drift"),
+            args.top_k,
+        ),
+        "top_lc_generic_positive_drift": rank_rows(
+            primary_rows,
+            "lc_generic_positive_drift",
+            lambda row: score_or_neg_inf(row, "lc_generic_positive_drift"),
+            args.top_k,
+        ),
+        "top_lc_grounded_risk": rank_rows(
+            primary_rows,
+            "lc_grounded_risk",
+            lambda row: score_or_neg_inf(row, "lc_grounded_risk"),
+            args.top_k,
+        ),
     }
 
     overlap_rows = [
@@ -663,6 +805,9 @@ def main():
         rank_distribution(primary_rows, "hall_specific_drift", d1_selected, descending=True),
         rank_distribution(primary_rows, "generic_positive_drift", d1_selected, descending=True),
         rank_distribution(primary_rows, "grounded_risk", d1_selected, descending=True),
+        rank_distribution(primary_rows, "lc_hall_specific_drift", d1_selected, descending=True),
+        rank_distribution(primary_rows, "lc_generic_positive_drift", d1_selected, descending=True),
+        rank_distribution(primary_rows, "lc_grounded_risk", d1_selected, descending=True),
     ]
 
     bins = token_step_bins(steps, args.token_step_bins)
@@ -685,6 +830,7 @@ def main():
         "target_index_fallback": args.target_index,
         "early_frac": args.early_frac,
         "late_frac": args.late_frac,
+        "label_conditional_frac": args.label_conditional_frac,
         "early_token_step_cut": early_cut,
         "late_token_step_cut": late_cut,
         "early_n": int(early_mask.sum()),
@@ -693,6 +839,20 @@ def main():
         "early_hallucinated_n": int((early_mask & (labels == 0)).sum()),
         "late_grounded_n": int((late_mask & (labels == 1)).sum()),
         "late_hallucinated_n": int((late_mask & (labels == 0)).sum()),
+        "label_conditional_windows": {
+            "grounded": {
+                "early_token_step_cut": label_cond["grounded_early_cut"],
+                "late_token_step_cut": label_cond["grounded_late_cut"],
+                "early_n": int(label_cond["grounded_early_mask"].sum()),
+                "late_n": int(label_cond["grounded_late_mask"].sum()),
+            },
+            "hallucinated": {
+                "early_token_step_cut": label_cond["hallucinated_early_cut"],
+                "late_token_step_cut": label_cond["hallucinated_late_cut"],
+                "early_n": int(label_cond["hallucinated_early_mask"].sum()),
+                "late_n": int(label_cond["hallucinated_late_mask"].sum()),
+            },
+        },
         "top_lists": top_lists,
         "d1_overlap_summary": overlap_rows,
         "d1_rank_summaries": rank_summaries,
@@ -735,6 +895,7 @@ def main():
             "grounded": summary["late_grounded_n"],
             "hallucinated": summary["late_hallucinated_n"],
         },
+        "label_conditional_windows": summary["label_conditional_windows"],
         "d1_overlap_summary": overlap_rows,
         "top_heads_preview": {
             name: heads[:5]
