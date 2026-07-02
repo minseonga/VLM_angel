@@ -389,14 +389,19 @@ def logistic_control_analysis(rows, metrics, bootstrap_iters, rng):
         y = labels_hallucinated(cur_rows)
         if len(np.unique(y)) < 2:
             continue
-        X = np.array([
+        X_full = np.array([
             [float(row[metric]), float(row["svar"]), float(row["token_step"])]
             for row in cur_rows
         ], dtype=np.float64)
-        X = standardize_train_test(X)
+        X_control = np.array([
+            [float(row["svar"]), float(row["token_step"])]
+            for row in cur_rows
+        ], dtype=np.float64)
+        X_full = standardize_train_test(X_full)
+        X_control = standardize_train_test(X_control)
 
-        def fit_score(indices):
-            x_i = X[indices]
+        def fit_score(x, indices):
+            x_i = x[indices]
             y_i = y[indices]
             if len(np.unique(y_i)) < 2:
                 return None
@@ -407,43 +412,67 @@ def logistic_control_analysis(rows, metrics, bootstrap_iters, rng):
             prob = clf.predict_proba(x_i)[:, 1]
             auc = binary_auc(y_i, prob)
             return {
-                "metric_coef": float(clf.coef_[0][0]),
-                "svar_coef": float(clf.coef_[0][1]),
-                "token_step_coef": float(clf.coef_[0][2]),
+                "coef": [float(x) for x in clf.coef_[0]],
                 "auc_in_sample": auc,
             }
 
-        base = fit_score(np.arange(len(y)))
-        if base is None:
+        full = fit_score(X_full, np.arange(len(y)))
+        control = fit_score(X_control, np.arange(len(y)))
+        if full is None or control is None:
             continue
 
         boot_metric_coef = []
-        boot_auc = []
+        boot_full_auc = []
+        boot_control_auc = []
+        boot_delta_auc = []
         for _ in range(bootstrap_iters):
             idx = rng.integers(0, len(y), size=len(y))
-            cur = fit_score(idx)
-            if cur is None:
+            cur_full = fit_score(X_full, idx)
+            cur_control = fit_score(X_control, idx)
+            if cur_full is None or cur_control is None:
                 continue
-            boot_metric_coef.append(cur["metric_coef"])
-            if cur["auc_in_sample"] is not None:
-                boot_auc.append(cur["auc_in_sample"])
+            boot_metric_coef.append(cur_full["coef"][0])
+            if cur_full["auc_in_sample"] is not None:
+                boot_full_auc.append(cur_full["auc_in_sample"])
+            if cur_control["auc_in_sample"] is not None:
+                boot_control_auc.append(cur_control["auc_in_sample"])
+            if cur_full["auc_in_sample"] is not None and cur_control["auc_in_sample"] is not None:
+                boot_delta_auc.append(cur_full["auc_in_sample"] - cur_control["auc_in_sample"])
+
+        full_auc = full["auc_in_sample"]
+        control_auc = control["auc_in_sample"]
+        delta_auc = None
+        if full_auc is not None and control_auc is not None:
+            delta_auc = float(full_auc - control_auc)
 
         out[metric] = {
             "n": int(len(y)),
             "grounded_n": int((y == 0).sum()),
             "hallucinated_n": int((y == 1).sum()),
-            "metric_coef": base["metric_coef"],
-            "svar_coef": base["svar_coef"],
-            "token_step_coef": base["token_step_coef"],
-            "auc_in_sample": base["auc_in_sample"],
+            "metric_coef": full["coef"][0],
+            "svar_coef": full["coef"][1],
+            "token_step_coef": full["coef"][2],
+            "control_svar_coef": control["coef"][0],
+            "control_token_step_coef": control["coef"][1],
+            "auc_in_sample": full_auc,
+            "control_auc_in_sample": control_auc,
+            "delta_auc_vs_control": delta_auc,
             "metric_coef_ci95": [
                 float(np.quantile(boot_metric_coef, 0.025)),
                 float(np.quantile(boot_metric_coef, 0.975)),
             ] if boot_metric_coef else None,
             "auc_in_sample_ci95": [
-                float(np.quantile(boot_auc, 0.025)),
-                float(np.quantile(boot_auc, 0.975)),
-            ] if boot_auc else None,
+                float(np.quantile(boot_full_auc, 0.025)),
+                float(np.quantile(boot_full_auc, 0.975)),
+            ] if boot_full_auc else None,
+            "control_auc_in_sample_ci95": [
+                float(np.quantile(boot_control_auc, 0.025)),
+                float(np.quantile(boot_control_auc, 0.975)),
+            ] if boot_control_auc else None,
+            "delta_auc_vs_control_ci95": [
+                float(np.quantile(boot_delta_auc, 0.025)),
+                float(np.quantile(boot_delta_auc, 0.975)),
+            ] if boot_delta_auc else None,
             "n_boot": int(len(boot_metric_coef)),
         }
     return out
@@ -561,6 +590,20 @@ def main():
         )[:5],
         "svar_matched_pairs": matched_svar["num_pairs"],
         "svar_token_step_matched_pairs": None if matched_svar_token is None else matched_svar_token["num_pairs"],
+        "logistic_delta_auc": sorted(
+            [
+                {
+                    "metric": metric,
+                    "auc": stats.get("auc_in_sample"),
+                    "control_auc": stats.get("control_auc_in_sample"),
+                    "delta_auc": stats.get("delta_auc_vs_control"),
+                }
+                for metric, stats in logistic.items()
+                if stats.get("delta_auc_vs_control") is not None
+            ],
+            key=lambda item: abs(item["delta_auc"]),
+            reverse=True,
+        )[:5] if isinstance(logistic, dict) and "error" not in logistic else [],
         "outputs": {
             "summary": str(output_dir / "stage1_controlled_analysis_summary.json"),
             "raw_csv": str(output_dir / "stage1_controlled_raw_metric_summary.csv"),
